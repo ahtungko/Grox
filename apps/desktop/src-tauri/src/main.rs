@@ -35,8 +35,8 @@ use tokio::{
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GROX_BUILD_COMMIT: &str = env!("GROX_BUILD_COMMIT");
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/dandandujie/Grox/releases/latest";
-const RELEASES_URL: &str = "https://api.github.com/repos/dandandujie/Grox/releases";
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/ahtungko/Grox/releases/latest";
+const RELEASES_URL: &str = "https://api.github.com/repos/ahtungko/Grox/releases";
 const GROK_INSTALL_PS1_URL: &str = "https://x.ai/cli/install.ps1";
 const GROK_INSTALL_SH_URL: &str = "https://x.ai/cli/install.sh";
 // The upstream built-in workflow has early `complete()` branches for empty
