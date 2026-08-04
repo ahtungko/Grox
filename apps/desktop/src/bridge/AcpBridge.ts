@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { GrokBridge } from "./GrokBridge";
+import { claimPendingBrowserLease } from "./browserLeaseBind";
 import { MODELS } from "./types";
 import type {
   AccountInfo,
@@ -45,6 +46,7 @@ import type {
   WorkflowTraceEntry,
   WorkflowRun,
 } from "./types";
+import { readStoredPermissionMode } from "../lib/permissionMode";
 
 export const ACP_METHODS = {
   initialize: "initialize",
@@ -148,6 +150,10 @@ class AcpRpcError extends Error {
 function isInvalidParamsError(error: unknown): boolean {
   if (error instanceof AcpRpcError && error.code === -32602) return true;
   return error instanceof Error && /\binvalid params\b/i.test(error.message);
+}
+
+function isMethodUnavailable(error: unknown): boolean {
+  return error instanceof AcpRpcError && (error.code === -32601 || error.code === -32602);
 }
 
 /**
@@ -660,6 +666,11 @@ interface ComputerSessionExtensions {
   leaseId: string;
 }
 
+interface BrowserSessionExtensions {
+  mcpServers: unknown[];
+  leaseId: string;
+}
+
 interface SessionDiskPreview {
   messages: Array<{ role: "user" | "assistant"; text: string }>;
   truncated: boolean;
@@ -1022,21 +1033,22 @@ export class AcpBridge implements GrokBridge {
   private toolFlushTimer: number | undefined;
   private diagnostics: string[] = [];
   private requestId = 0;
+  /** 与原生 ACP 子进程绑定，防止旧异步请求写入新子进程。 */
+  private acpGeneration = 0;
+  private reconnecting: Promise<void> | null = null;
   private authMethodId: string | undefined;
   private authState: AuthState = { required: false, inProgress: false };
   private modelState: ModelState = { models: MODELS, currentId: MODELS[0].id };
   private runtimeCommandBase: SlashCommand[] = [];
   private runtimeCommands: SlashCommand[] = [];
   private runtimeCommandTags = new Map<string, string>();
-  private permissionMode: PermissionMode =
-    localStorage.getItem("grok.permissionMode") === "auto"
-      ? "auto"
-      : localStorage.getItem("grok.permissionMode") === "bypass"
-        ? "bypass"
-        : "default";
+  private permissionMode: PermissionMode = readStoredPermissionMode(localStorage.getItem("grok.permissionMode"));
+  private computerUseEnabled = localStorage.getItem("grox.computerUseEnabled") !== "0";
+  private browserUseEnabled = localStorage.getItem("grox.browserUseEnabled") !== "0";
   private workspace = "";
   private sessionWorkspaces = new Map<string, string>();
   private computerLeases = new Map<string, string>();
+  private browserLeases = new Map<string, string>();
   private activeComputerSessions = new Set<string>();
   private activeComputerToolCalls = new Set<string>();
   private workflowChildTraces = new Map<string, { sessionId: string; runId: string; trace: WorkflowAgentTrace }>();
@@ -1175,7 +1187,10 @@ export class AcpBridge implements GrokBridge {
     // Diagnostics belong to one concrete child process. Keeping stderr from a
     // process replaced during a Tauri hot reload produces misleading errors.
     this.diagnostics = [];
-    await invoke("acp_spawn", { cwd: this.workspace });
+    this.acpGeneration = await invoke<number>("acp_spawn", {
+      cwd: this.workspace,
+      computerUseEnabled: this.computerUseEnabled,
+    });
     // The inference proxy gates on the client version, so never assert a
     // hardcoded one: report the actual CLI version whenever it is detectable.
     const clientVersion = await this.detectCliVersion();
@@ -1326,9 +1341,44 @@ export class AcpBridge implements GrokBridge {
       request.reject(new Error(message));
     }
     this.pending.clear();
-    for (const sessionId of this.knownSessions) {
-      this.emit({ type: "error", sessionId, message });
-    }
+    const affected = [...this.knownSessions];
+    this.knownSessions.clear();
+    this.loadPromises.clear();
+    this.cursors.clear();
+    this.sessionOptions.clear();
+    this.beginReconnect(affected, message);
+  }
+
+  private beginReconnect(sessionIds: string[], reason: string) {
+    if (this.reconnecting) return;
+    const reconnect = (async () => {
+      let lastError = reason;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        this.setAuthState({ inProgress: true, error: `Agent 异常退出，正在自动重连（${attempt}/2）…` });
+        await new Promise((resolve) => window.setTimeout(resolve, attempt * 800));
+        try {
+          await this.initializeAgent();
+          this.setAuthState({ inProgress: false, error: undefined });
+          for (const sessionId of sessionIds) {
+            this.emit({
+              type: "block_add",
+              sessionId,
+              block: { type: "system", id: uid(), text: "Agent 已自动重连；下次发送会重新绑定会话", ts: Date.now(), kind: "info" },
+            });
+            this.emit({ type: "status", sessionId, status: "idle" });
+          }
+          return;
+        } catch (error) {
+          lastError = errorText(error);
+        }
+      }
+      this.setAuthState({ inProgress: false, error: `Agent 自动重连失败：${lastError}` });
+      for (const sessionId of sessionIds) this.emit({ type: "error", sessionId, message: lastError });
+      throw new Error(lastError);
+    })();
+    this.reconnecting = reconnect.finally(() => { this.reconnecting = null; });
+    this.ready = this.reconnecting;
+    void this.reconnecting.catch(() => {});
   }
 
   private onLine(line: string) {
@@ -2155,7 +2205,7 @@ export class AcpBridge implements GrokBridge {
   }
 
   private async sendRaw(message: JsonRpcMessage): Promise<void> {
-    await invoke("acp_send", { line: JSON.stringify(message) });
+    await invoke("acp_send", { line: JSON.stringify(message), generation: this.acpGeneration });
   }
 
   private requestRaw(method: string, params: unknown, timeoutMs = 30_000, onPending?: (id: RpcId) => void): Promise<unknown> {
@@ -2262,6 +2312,10 @@ export class AcpBridge implements GrokBridge {
   }
 
   setPermissionMode(mode: PermissionMode): void {
+    if (mode === "bypass" && this.computerUseEnabled) {
+      this.computerUseEnabled = false;
+      localStorage.setItem("grox.computerUseEnabled", "0");
+    }
     this.permissionMode = mode;
     localStorage.setItem("grok.permissionMode", mode);
     void this.notify("x.ai/yolo_mode_changed", {
@@ -2275,6 +2329,88 @@ export class AcpBridge implements GrokBridge {
         this.emit({ type: "error", sessionId, message: errorText(error) });
       }
     });
+  }
+
+  setComputerUseEnabled(enabled: boolean): void {
+    if (enabled && this.permissionMode === "bypass") {
+      this.setPermissionMode("default");
+    }
+    this.computerUseEnabled = enabled;
+    localStorage.setItem("grox.computerUseEnabled", enabled ? "1" : "0");
+    if (!enabled) {
+      for (const leaseId of this.computerLeases.values()) {
+        void invoke("computer_shutdown_lease", { leaseId }).catch(() => {});
+        void invoke("computer_emergency_stop", { leaseId }).catch(() => {});
+      }
+    }
+  }
+
+  getComputerUseEnabled(): boolean {
+    return this.computerUseEnabled;
+  }
+
+  setBrowserUseEnabled(enabled: boolean): void {
+    this.browserUseEnabled = enabled;
+    localStorage.setItem("grox.browserUseEnabled", enabled ? "1" : "0");
+    if (!enabled) {
+      for (const leaseId of this.browserLeases.values()) {
+        void invoke("browser_shutdown_lease", { leaseId }).catch(() => {});
+      }
+      this.browserLeases.clear();
+    }
+  }
+
+  getBrowserUseEnabled(): boolean {
+    return this.browserUseEnabled;
+  }
+
+  private async discardLeaseAttempt(computer: {
+    pluginDirs: string[];
+    computerLeaseId: string;
+    browserLeaseId: string;
+  }): Promise<void> {
+    if (computer.computerLeaseId) {
+      await invoke("computer_shutdown_lease", { leaseId: computer.computerLeaseId }).catch(() => {});
+    }
+    if (computer.browserLeaseId) {
+      await invoke("browser_shutdown_lease", { leaseId: computer.browserLeaseId }).catch(() => {});
+      this.browserLeases.delete(`pending:${computer.browserLeaseId}`);
+      for (const [key, leaseId] of [...this.browserLeases.entries()]) {
+        if (leaseId === computer.browserLeaseId) this.browserLeases.delete(key);
+      }
+    }
+  }
+
+  private async resolveComputerExtensions(): Promise<{
+    pluginDirs: string[];
+    computerLeaseId: string;
+    browserLeaseId: string;
+  }> {
+    let pluginDirs: string[] = [];
+    let computerLeaseId = "";
+    let browserLeaseId = "";
+
+    if (this.computerUseEnabled && this.permissionMode !== "bypass") {
+      const computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
+      pluginDirs = computer.pluginDirs ?? [];
+      computerLeaseId = computer.leaseId ?? "";
+    }
+
+    if (this.browserUseEnabled) {
+      try {
+        const browser = await invoke<BrowserSessionExtensions>("browser_session_extensions");
+        if (browser.leaseId) {
+          browserLeaseId = browser.leaseId;
+          // Stash under a synthetic key until session id is known; callers also
+          // record per-session after session/new.
+          this.browserLeases.set(`pending:${browser.leaseId}`, browser.leaseId);
+        }
+      } catch {
+        // Browser Use is optional — missing Chrome must not block session creation.
+      }
+    }
+
+    return { pluginDirs, computerLeaseId, browserLeaseId };
   }
 
   private sessionPermissionMeta() {
@@ -2539,36 +2675,50 @@ export class AcpBridge implements GrokBridge {
   private async createSession(cwd: string): Promise<void> {
     const metaRequest = await this.sessionMeta(cwd);
     const preferredModel = localStorage.getItem("grok.model")?.trim();
-    const computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
+    let computer = await this.resolveComputerExtensions();
     let responseValue: unknown;
     try {
-      responseValue = await this.request(ACP_METHODS.sessionNew, {
-        cwd,
-        mcpServers: computer.mcpServers,
-        _meta: {
-          ...metaRequest,
-          ...(preferredModel ? { modelId: preferredModel } : {}),
-          pluginDirs: computer.pluginDirs,
-        },
-      });
+      try {
+        responseValue = await this.request(ACP_METHODS.sessionNew, {
+          cwd,
+          // Bearer tokens are injected natively from lease ids — never from the WebView.
+          mcpServers: [],
+          _meta: {
+            ...metaRequest,
+            ...(preferredModel ? { modelId: preferredModel } : {}),
+            ...(computer.pluginDirs.length ? { pluginDirs: computer.pluginDirs } : {}),
+            ...(computer.computerLeaseId ? { groxComputerLeaseId: computer.computerLeaseId } : {}),
+            ...(computer.browserLeaseId ? { groxBrowserLeaseId: computer.browserLeaseId } : {}),
+          },
+        });
+      } catch (error) {
+        // Older Grok CLIs reject the v0.2.3 Computer Use session extensions
+        // instead of ignoring unknown fields. Keep core ACP usable by retrying
+        // with the standard session/new shape.
+        if (!isInvalidParamsError(error)) throw error;
+        await this.discardLeaseAttempt(computer);
+        computer = { pluginDirs: [], computerLeaseId: "", browserLeaseId: "" };
+        responseValue = await this.request(ACP_METHODS.sessionNew, {
+          cwd,
+          mcpServers: [],
+          _meta: {
+            ...metaRequest,
+            ...(preferredModel ? { modelId: preferredModel } : {}),
+          },
+        });
+      }
     } catch (error) {
-      // Older Grok CLIs reject the v0.2.3 Computer Use session extensions
-      // instead of ignoring unknown fields. Keep core ACP usable by retrying
-      // with the standard session/new shape.
-      if (!isInvalidParamsError(error)) throw error;
-      responseValue = await this.request(ACP_METHODS.sessionNew, {
-        cwd,
-        mcpServers: [],
-        _meta: {
-          ...metaRequest,
-          ...(preferredModel ? { modelId: preferredModel } : {}),
-        },
-      });
+      await this.discardLeaseAttempt(computer);
+      throw error;
     }
     const response = record(responseValue);
     const sessionId = string(response?.sessionId);
-    if (!sessionId) throw new Error("session/new 未返回 sessionId");
-    this.computerLeases.set(sessionId, computer.leaseId);
+    if (!sessionId) {
+      await this.discardLeaseAttempt(computer);
+      throw new Error("session/new 未返回 sessionId");
+    }
+    if (computer.computerLeaseId) this.computerLeases.set(sessionId, computer.computerLeaseId);
+    claimPendingBrowserLease(this.browserLeases, sessionId, computer.browserLeaseId);
     this.captureModelState(response);
     this.captureRuntimeCommands(response);
     const detail = record(record(response?._meta)?.["x.ai/sessionDetail"]);
@@ -2651,19 +2801,31 @@ export class AcpBridge implements GrokBridge {
     this.sessionWorkspaces.set(id, meta.cwd);
     this.cursors.set(id, { toolBlocks: new Map() });
     this.replaying.set(id, emptySession(meta));
+    let computer = {
+      pluginDirs: [] as string[],
+      computerLeaseId: "",
+      browserLeaseId: "",
+    };
     try {
       const metaRequest = await this.sessionMeta(meta.cwd);
-      const computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
+      computer = await this.resolveComputerExtensions();
       let response: unknown;
       try {
         response = await this.request(ACP_METHODS.sessionLoad, {
           sessionId: id,
           cwd: meta.cwd,
-          mcpServers: computer.mcpServers,
-          _meta: { ...metaRequest, pluginDirs: computer.pluginDirs },
+          mcpServers: [],
+          _meta: {
+            ...metaRequest,
+            ...(computer.pluginDirs.length ? { pluginDirs: computer.pluginDirs } : {}),
+            ...(computer.computerLeaseId ? { groxComputerLeaseId: computer.computerLeaseId } : {}),
+            ...(computer.browserLeaseId ? { groxBrowserLeaseId: computer.browserLeaseId } : {}),
+          },
         }, 2 * 60_000);
       } catch (error) {
         if (!isInvalidParamsError(error)) throw error;
+        await this.discardLeaseAttempt(computer);
+        computer = { pluginDirs: [], computerLeaseId: "", browserLeaseId: "" };
         response = await this.request(ACP_METHODS.sessionLoad, {
           sessionId: id,
           cwd: meta.cwd,
@@ -2672,10 +2834,13 @@ export class AcpBridge implements GrokBridge {
         }, 2 * 60_000);
       }
       const previousLease = this.computerLeases.get(id);
-      if (previousLease && previousLease !== computer.leaseId) {
+      if (previousLease && previousLease !== computer.computerLeaseId) {
+        await invoke("computer_shutdown_lease", { leaseId: previousLease }).catch(() => {});
         await invoke("computer_clear_emergency_stop", { leaseId: previousLease }).catch(() => {});
       }
-      this.computerLeases.set(id, computer.leaseId);
+      if (computer.computerLeaseId) this.computerLeases.set(id, computer.computerLeaseId);
+      else this.computerLeases.delete(id);
+      claimPendingBrowserLease(this.browserLeases, id, computer.browserLeaseId);
       this.flushStreamAppends(id);
       this.flushToolPatches(id);
       this.captureModelState(response);
@@ -2707,6 +2872,7 @@ export class AcpBridge implements GrokBridge {
       // reconstructs its deep-research task archive as well.
       void this.hydrateWorkflowHistory(id, meta.cwd);
     } catch (error) {
+      await this.discardLeaseAttempt(computer);
       this.replaying.delete(id);
       throw error;
     }
@@ -3013,6 +3179,37 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
+  async interject(sessionId: string, text: string, options: PromptOptions): Promise<boolean> {
+    await this.ready;
+    const trimmed = text.trim();
+    if (!trimmed && (options.attachments?.length ?? 0) === 0) return false;
+    const id = uid();
+    try {
+      await this.request("x.ai/interject", {
+        sessionId,
+        text: trimmed,
+        interjectionId: id,
+        content: promptContent(trimmed, options.attachments ?? []),
+      }, 30_000);
+    } catch (error) {
+      if (isMethodUnavailable(error)) return false;
+      throw error;
+    }
+    this.emit({
+      type: "block_add",
+      sessionId,
+      block: {
+        type: "user",
+        id,
+        text: trimmed,
+        interjected: true,
+        attachments: options.attachments?.map(({ id, kind, name, mime, size }) => ({ id, kind, name, mime, size })),
+        ts: Date.now(),
+      },
+    });
+    return true;
+  }
+
   cancel(sessionId: string): void {
     for (const [blockId, interaction] of this.interactions) {
       if (interaction.sessionId !== sessionId) continue;
@@ -3035,6 +3232,7 @@ export class AcpBridge implements GrokBridge {
     const leaseId = this.computerLeases.get(sessionId);
     if (leaseId) {
       await invoke("computer_emergency_stop", { leaseId });
+      await invoke("computer_shutdown_lease", { leaseId }).catch(() => {});
     }
     this.cancel(sessionId);
   }
