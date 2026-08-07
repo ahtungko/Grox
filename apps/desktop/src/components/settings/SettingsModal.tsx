@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { bridge } from "../../bridge";
-import type { ConfigDocument, ProviderKind } from "../../bridge/types";
+import type { ConfigDocument, ProviderApiBackend, ProviderKind } from "../../bridge/types";
 import { EFFORTS } from "../../bridge/types";
 import { useDesktop } from "../../state/store";
 import { usePreferences } from "../../state/preferences";
@@ -169,7 +169,7 @@ function General() {
         aria-label={zh ? "权限模式" : "Permission mode"}
       />
     </Row>
-    <Row label="Computer Use" hint={zh ? "默认开启。Windows 提供完整键鼠控制；macOS/Linux 以截图观察为主，点击/输入可能需要辅助功能或 cliclick。与 Bypass 互斥；变更后需新建或重新加载会话。" : "On by default. Windows has full input control; macOS/Linux are observation-first and may need Accessibility / cliclick. Mutually exclusive with Bypass; reload or create a session after changing."}><Toggle on={computerUse} onChange={setComputerUse} /></Row>
+    <Row label="Computer Use" hint={zh ? "写入本机 host_prefs（主机权威）。关闭后无法仅靠 localStorage 重开。与 Bypass 互斥；变更后需新建或重新加载会话。" : "Persists to host_prefs (host authority). localStorage alone cannot re-open after host off. Mutually exclusive with Bypass; reload session after change."}><Toggle on={computerUse} onChange={setComputerUse} /></Row>
     <Row label="Browser Use" hint={zh ? "默认开启。提供打开 URL 与本机 Chrome/Edge 无头截图 MCP；变更后需新建或重新加载会话。" : "On by default. Mounts URL open + headless Chrome/Edge screenshot MCP. Reload or create a session after changing."}><Toggle on={browserUse} onChange={setBrowserUse} /></Row>
     <Row label={zh ? "桌面通知" : "Desktop notifications"} hint={zh ? "窗口在后台时，权限批准与问答会弹出系统通知。" : "When Grox is in the background, permission and question prompts raise OS notifications."}><Toggle on={desktopNotify} onChange={(on) => { localStorage.setItem("grox.desktopNotify", on ? "1" : "0"); setDesktopNotify(on); if (on) void import("../../lib/notify").then((module) => module.ensureNotifyPermission()); }} /></Row>
   </div>;
@@ -276,6 +276,7 @@ function ProviderAndModels() {
   const [apiKey, setApiKey] = useState("");
   const [apiKeyHidden, setApiKeyHidden] = useState(false);
   const [baseUrl, setBaseUrl] = useState(provider.kind === "compatible" ? "" : (provider.baseUrl ?? ""));
+  const [apiBackend, setApiBackend] = useState<ProviderApiBackend>("auto");
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [residentModels, setResidentModels] = useState<string[]>([]);
   const [customModel, setCustomModel] = useState("");
@@ -295,6 +296,7 @@ function ProviderAndModels() {
     setEditingProfileId(profile.id);
     setProfileName(profile.name);
     setBaseUrl(profile.baseUrl);
+    setApiBackend(profile.apiBackend);
     setAvailableModels(profile.availableModels);
     setResidentModels(profile.residentModels);
     setApiKey("");
@@ -310,6 +312,7 @@ function ProviderAndModels() {
     setApiKey("");
     setApiKeyHidden(false);
     setBaseUrl("");
+    setApiBackend("auto");
     setAvailableModels([]);
     setResidentModels([]);
     setCustomModel("");
@@ -347,7 +350,7 @@ function ProviderAndModels() {
           name: profileName,
           apiKey: apiKey.trim() || undefined,
           baseUrl,
-          apiBackend: "chat_completions",
+          apiBackend,
           residentModels,
         });
         setEditingProfileId(saved.id);
@@ -419,7 +422,8 @@ function ProviderAndModels() {
         {kind === "compatible" && <label className="block"><span className="lbl !text-[9px]">{zh ? "供应商名称" : "PROVIDER NAME"}</span><Input value={profileName} onChange={setProfileName} placeholder={zh ? "例如：公司中转 / OpenRouter" : "e.g. Company gateway / OpenRouter"} /></label>}
         <label className="block"><span className="lbl !text-[9px]">API KEY</span><SecretInput value={apiKey} onChange={(value) => { setApiKey(value); if (kind === "compatible") setAvailableModels([]); }} hidden={apiKeyHidden} onToggle={() => setApiKeyHidden((value) => !value)} placeholder={editingProfileId && profiles.find((item) => item.id === editingProfileId)?.hasApiKey ? (zh ? "已保存 · 留空则保持原密钥" : "Saved · leave blank to keep") : "xai-…"} /></label>
         {kind === "official" ? <div><span className="lbl !text-[9px]">BASE URL</span><div className="h-8 rounded-[4px] border border-line bg-void px-2.5 font-mono text-[10px] leading-8 text-dim">https://api.x.ai/v1</div></div> : <label className="block"><span className="lbl !text-[9px]">BASE URL</span><Input value={baseUrl} onChange={(value) => { setBaseUrl(value); setAvailableModels([]); setResidentModels([]); }} placeholder="https://example.com/v1" /></label>}
-        {kind === "compatible" && <p className="col-span-2 rounded-[4px] border border-line bg-void/60 px-2.5 py-2 text-[9.5px] leading-relaxed text-dim">{zh ? "Grox 将真实 Key 仅注入当前 ACP 子进程；对于当前模型及 CLI 标题别名，写入可追踪的官方 env_key、base_url 与 api_backend=chat_completions 声明来兼容标准 OpenAI 服务。切走供应商时会原样恢复，不会写入真实 Key 或批量模型覆盖。" : "Grox injects the literal key only into the current ACP child. For the active model and CLI title alias it adds tracked, documented env_key, base_url, and api_backend=chat_completions declarations for standard OpenAI services, restoring them on switch. It never writes the literal key or bulk model overrides."}</p>}
+        {kind === "compatible" && <label className="block"><span className="lbl !text-[9px]">API BACKEND</span><ChipSelect variant="field" menuPlacement="down" fullWidth activeId={apiBackend} label={apiBackend === "auto" ? (zh ? "自动识别" : "Auto detect") : apiBackend === "responses" ? "Responses API" : "Chat Completions"} items={[{ id: "auto", label: zh ? "自动识别" : "Auto detect", hint: zh ? "标准服务默认 Chat Completions，已知 Responses 网关自动匹配" : "Chat Completions by default; known Responses gateways are detected" }, { id: "chat_completions", label: "Chat Completions", hint: "/chat/completions" }, { id: "responses", label: "Responses API", hint: "/responses" }]} onSelect={(id) => setApiBackend(id as ProviderApiBackend)} aria-label={zh ? "API 请求协议" : "API backend"} /></label>}
+        {kind === "compatible" && <p className="col-span-2 rounded-[4px] border border-line bg-void/60 px-2.5 py-2 text-[9.5px] leading-relaxed text-dim">{zh ? "Grox 只把真实 Key 注入当前 ACP 子进程，并为当前模型与标题别名写入可恢复的 env_key、base_url 和所选 API 协议；切走供应商时原样恢复用户配置。" : "Grox injects the literal key only into the active ACP child and applies reversible env_key, base_url, and API backend overrides for the selected models and title alias."}</p>}
       </div>
       {kind === "compatible" && <div className="mt-4 grid grid-cols-2 gap-3 border-t border-line pt-4">
         <div className="min-w-0">

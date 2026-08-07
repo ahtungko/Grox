@@ -8,10 +8,14 @@ import { Wordmark } from "../fx/Wordmark";
 import { Icon } from "../fx/Icon";
 import type { Session, SessionMeta, SessionStatus } from "../../bridge/types";
 import { BlackHole } from "../fx/BlackHole";
+import { normalizeSessionQuery, sessionMatchesLoadedContent } from "../../lib/sessionSearch";
 
 export function Sidebar() {
   const { t, language } = useI18n();
   const width = usePreferences((state) => state.sidebarWidth);
+  const theme = usePreferences((state) => state.theme);
+  const setLanguage = usePreferences((state) => state.setLanguage);
+  const setTheme = usePreferences((state) => state.setTheme);
   const sessionIndex = useDesktop((state) => state.sessionIndex);
   const sessions = useDesktop((state) => state.sessions);
   const activeId = useDesktop((state) => state.activeId);
@@ -31,6 +35,9 @@ export function Sidebar() {
   const historyCount = useDesktop((state) => state.historyCount);
   const historyError = useDesktop((state) => state.historyError);
   const [accountOpen, setAccountOpen] = useState(false);
+  const [sessionQuery, setSessionQuery] = useState("");
+  const [historyMatches, setHistoryMatches] = useState<Set<string>>(() => new Set());
+  const [historySearching, setHistorySearching] = useState(false);
   const accountRef = useRef<HTMLDivElement>(null);
   const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(
     () => new Set(activeProjectId ? [activeProjectId] : []),
@@ -61,8 +68,46 @@ export function Sidebar() {
   const orderedSessions = [...sessionIndex].sort(
     (a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || b.updatedAt - a.updatedAt,
   );
-  const activeProjects = orderedProjects.filter((project) => !project.archived);
-  const archivedProjects = orderedProjects.filter((project) => project.archived);
+  const sessionSearchIdsKey = sessionIndex.map((session) => session.id).join("\n");
+  const normalizedQuery = normalizeSessionQuery(sessionQuery);
+  const matchedSessions = normalizedQuery
+    ? orderedSessions.filter((meta) =>
+        historyMatches.has(meta.id) || sessionMatchesLoadedContent(meta, sessions[meta.id], normalizedQuery)
+      )
+    : orderedSessions;
+  const matchedWorkspaceKeys = new Set(matchedSessions.map((session) => workspaceKey(session.cwd)));
+  const activeProjects = orderedProjects.filter(
+    (project) => !project.archived && (!normalizedQuery || matchedWorkspaceKeys.has(workspaceKey(project.path))),
+  );
+  const archivedProjects = orderedProjects.filter(
+    (project) => project.archived && (!normalizedQuery || matchedWorkspaceKeys.has(workspaceKey(project.path))),
+  );
+
+  useEffect(() => {
+    if (!normalizedQuery) {
+      setHistoryMatches(new Set());
+      setHistorySearching(false);
+      return;
+    }
+    let cancelled = false;
+    setHistorySearching(true);
+    const timeout = window.setTimeout(() => {
+      void invoke<string[]>("search_session_history", {
+        query: normalizedQuery,
+        sessionIds: sessionIndex.map((session) => session.id),
+      }).then((ids) => {
+        if (!cancelled) setHistoryMatches(new Set(ids));
+      }).catch(() => {
+        if (!cancelled) setHistoryMatches(new Set());
+      }).finally(() => {
+        if (!cancelled) setHistorySearching(false);
+      });
+    }, 220);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [normalizedQuery, sessionSearchIdsKey]);
 
   return (
     <aside className="relative flex shrink-0 flex-col border-r border-line bg-panel" style={{ width }}>
@@ -81,6 +126,21 @@ export function Sidebar() {
           {t("newProject")}
           <span className="ml-auto font-mono text-[9.5px] text-faint">Ctrl N</span>
         </button>
+        <div className="mt-1.5 flex h-8 items-center gap-2 rounded-[4px] border border-line2 bg-void px-2.5 focus-within:border-line3">
+          <Icon name="search" size={11} className={historySearching ? "animate-pulse text-acc" : "text-dim"} />
+          <input
+            value={sessionQuery}
+            onChange={(event) => setSessionQuery(event.target.value)}
+            placeholder={language === "zh-CN" ? "搜索会话标题与内容" : "Search titles and content"}
+            aria-label={language === "zh-CN" ? "搜索会话标题与内容" : "Search session titles and content"}
+            className="min-w-0 flex-1 bg-transparent text-[10.5px] text-fg outline-none placeholder:text-faint"
+          />
+          {sessionQuery && (
+            <button type="button" onClick={() => setSessionQuery("")} className="text-faint hover:text-fg" aria-label={language === "zh-CN" ? "清除搜索" : "Clear search"}>
+              <Icon name="x" size={10} />
+            </button>
+          )}
+        </div>
         <button
           onClick={() => void refreshHistory()}
           disabled={historySyncing}
@@ -96,14 +156,15 @@ export function Sidebar() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
-        <SectionTitle label={t("projects")} count={projects.length} />
+        <SectionTitle label={normalizedQuery ? (language === "zh-CN" ? "搜索结果" : "SEARCH RESULTS") : t("projects")} count={normalizedQuery ? matchedSessions.length : projects.length} />
         {activeProjects.map((project) => (
           <ProjectGroup
             key={project.id}
             project={project}
             active={project.id === activeProjectId}
-            expanded={expandedProjectIds.has(project.id)}
-            sessions={orderedSessions.filter((session) => sameWorkspace(session.cwd, project.path))}
+            expanded={Boolean(normalizedQuery) || expandedProjectIds.has(project.id)}
+            sessions={matchedSessions.filter((session) => sameWorkspace(session.cwd, project.path))}
+            showArchived={Boolean(normalizedQuery)}
             activeId={activeId}
             loadedSessions={sessions}
             onOpenSession={(id) => void openSession(id)}
@@ -116,14 +177,15 @@ export function Sidebar() {
           />
         ))}
         {archivedProjects.length > 0 && (
-          <ArchiveGroup label={t("archived")}>
+          <ArchiveGroup label={t("archived")} forceOpen={Boolean(normalizedQuery)}>
             {archivedProjects.map((project) => (
               <ProjectGroup
                 key={project.id}
                 project={project}
                 active={project.id === activeProjectId}
-                expanded={expandedProjectIds.has(project.id)}
-                sessions={orderedSessions.filter((session) => sameWorkspace(session.cwd, project.path))}
+                expanded={Boolean(normalizedQuery) || expandedProjectIds.has(project.id)}
+                sessions={matchedSessions.filter((session) => sameWorkspace(session.cwd, project.path))}
+                showArchived={Boolean(normalizedQuery)}
                 activeId={activeId}
                 loadedSessions={sessions}
                 onOpenSession={(id) => void openSession(id)}
@@ -136,6 +198,11 @@ export function Sidebar() {
               />
             ))}
           </ArchiveGroup>
+        )}
+        {normalizedQuery && !historySearching && matchedSessions.length === 0 && (
+          <p className="px-2 py-6 text-center font-mono text-[9.5px] text-faint">
+            {language === "zh-CN" ? "没有匹配的历史会话" : "NO MATCHING SESSIONS"}
+          </p>
         )}
       </div>
 
@@ -163,9 +230,29 @@ export function Sidebar() {
           </p>
         </button>
         <button
+          type="button"
+          onClick={() => setLanguage(language === "zh-CN" ? "en-US" : "zh-CN")}
+          className="flex h-7 min-w-7 shrink-0 items-center justify-center rounded-[3px] px-1 font-mono text-[9px] text-dim transition-colors hover:bg-high hover:text-fg focus-visible:outline focus-visible:outline-1 focus-visible:outline-acc"
+          title={language === "zh-CN" ? "切换至 English" : "Switch to 简体中文"}
+          aria-label={language === "zh-CN" ? "切换至 English" : "Switch to 简体中文"}
+        >
+          {language === "zh-CN" ? "中" : "EN"}
+        </button>
+        <button
+          type="button"
+          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[3px] text-dim transition-colors hover:bg-high hover:text-fg focus-visible:outline focus-visible:outline-1 focus-visible:outline-acc"
+          title={theme === "dark" ? (language === "zh-CN" ? "切换至明亮主题" : "Switch to light theme") : (language === "zh-CN" ? "切换至暗黑主题" : "Switch to dark theme")}
+          aria-label={theme === "dark" ? (language === "zh-CN" ? "切换至明亮主题" : "Switch to light theme") : (language === "zh-CN" ? "切换至暗黑主题" : "Switch to dark theme")}
+        >
+          <Icon name={theme === "dark" ? "moon" : "sun"} size={12} />
+        </button>
+        <button
+          type="button"
           onClick={() => setSettingsOpen(true)}
-          className="flex h-7 w-7 items-center justify-center text-dim hover:text-fg"
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[3px] text-dim transition-colors hover:bg-high hover:text-fg focus-visible:outline focus-visible:outline-1 focus-visible:outline-acc"
           title={t("settings")}
+          aria-label={t("settings")}
         >
           <Icon name="gear" size={13} />
         </button>
@@ -219,6 +306,7 @@ function ProjectGroup({
   sessions,
   activeId,
   loadedSessions,
+  showArchived,
   onOpenSession,
   onToggle,
 }: {
@@ -228,10 +316,11 @@ function ProjectGroup({
   sessions: SessionMeta[];
   activeId: string | null;
   loadedSessions: Record<string, Session>;
+  showArchived?: boolean;
   onOpenSession(id: string): void;
   onToggle(): void;
 }) {
-  const visible = sessions.filter((session) => !session.archived);
+  const visible = showArchived ? sessions : sessions.filter((session) => !session.archived);
   return (
     <div className="mb-1">
       <ProjectRow
@@ -269,9 +358,9 @@ function SectionTitle({ label, count }: { label: string; count: number }) {
   );
 }
 
-function ArchiveGroup({ label, children }: { label: string; children: React.ReactNode }) {
+function ArchiveGroup({ label, children, forceOpen = false }: { label: string; children: React.ReactNode; forceOpen?: boolean }) {
   return (
-    <details className="group/archive mt-1">
+    <details className="group/archive mt-1" open={forceOpen || undefined}>
       <summary className="flex cursor-pointer items-center gap-1.5 px-2 py-1 font-mono text-[9.5px] text-faint hover:text-mute">
         <Icon name="chevronRight" size={8} className="transition-transform group-open/archive:rotate-90" />
         {label}
@@ -342,7 +431,12 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
       >
         <Icon name="plus" size={12} />
       </button>
-      <button onClick={() => setMenu((open) => !open)} className="hidden h-5 w-5 items-center justify-center text-dim hover:text-fg group-hover:flex">
+      <button
+        onClick={() => setMenu((open) => !open)}
+        className="flex h-5 w-5 shrink-0 items-center justify-center text-dim opacity-0 transition-opacity hover:text-fg group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100"
+        aria-label={language === "zh-CN" ? "项目操作" : "Project actions"}
+        aria-expanded={menu}
+      >
         <Icon name="more" size={12} />
       </button>
       {menu && (
@@ -397,7 +491,12 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
         ) : (
           <span className="min-w-0 flex-1 truncate text-[11px] text-fg2">{meta.title}</span>
         )}
-        <button onClick={(event) => { event.stopPropagation(); setMenu((open) => !open); }} className="hidden h-5 w-5 items-center justify-center text-dim hover:text-fg group-hover:flex">
+        <button
+          onClick={(event) => { event.stopPropagation(); setMenu((open) => !open); }}
+          className="flex h-5 w-5 shrink-0 items-center justify-center text-dim opacity-0 transition-opacity hover:text-fg group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100"
+          aria-label={language === "zh-CN" ? "会话操作" : "Session actions"}
+          aria-expanded={menu}
+        >
           <Icon name="more" size={12} />
         </button>
       </div>
